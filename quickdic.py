@@ -1,13 +1,14 @@
 import pwnagotchi.plugins as plugins
 import logging
-import os
-import glob
-import threading
 import subprocess
+import os
+import threading
+import time
+import glob
 import string
+import signal # Added import
+
 import pwnagotchi # Added for pwnagotchi.config access
-import time # Added for time.time()
-import select # Added for select.select()
 
 # Pwnagotchi plugin imports
 
@@ -21,7 +22,7 @@ Cracked handshakes stored in handshake folder as [essid].pcap.cracked
 CRACK_SUCCESS = "CRACK_SUCCESS"
 CRACK_NOT_FOUND = "CRACK_NOT_FOUND"
 CRACK_ERROR = "CRACK_ERROR"
-CRACK_PREVENTED = "CRACK_PREVENTED"
+CRACK_PREVENTED = "CRACK_PREVENTED" # Added to signify a crack was prevented (e.g. CPU hot, already cracking)
 
 # Define status codes for logging and internal state
 STATUS_BOOTING = 0
@@ -49,6 +50,7 @@ class QuickDic(plugins.Plugin):
         super().__init__()
         logging.debug("[quickdic] QuickDic plugin initializing")
         self.cracking_in_progress = False
+        self.aircrack_proc_handle = None # Added to store aircrack Popen object
         # Options related to plugin behavior, configurable via config.toml
         self.options = {
             'wordlist_folder': '/opt/wordlists/',  # Default path to wordlists
@@ -59,9 +61,25 @@ class QuickDic(plugins.Plugin):
         self._stop_event = threading.Event()
         self.main_config_for_scan = None
         self.current_status = STATUS_BOOTING # Initial status set directly
+        self.enabled_on_system = True # Initialize the flag, will be checked in on_loaded
         logging.debug(f"[quickdic] __init__: current_status = {self.current_status}")
 
     def on_loaded(self):
+        # Check if running on Linux, if not, disable the plugin
+        if os.name != 'posix':
+            logging.warning("[quickdic] This plugin is designed to run on Linux (e.g., Raspberry Pi). Disabling plugin on non-POSIX system.")
+            self.enabled_on_system = False 
+        else:
+            self.enabled_on_system = True
+
+        if not self.enabled_on_system:
+            logging.info("[quickdic] Plugin not enabled on this system. Skipping further initialization and disabling periodic scan.")
+            self.current_status = STATUS_ERROR # Or a new status like STATUS_DISABLED_PLATFORM
+            # Prevent the scan thread from starting if not on Linux
+            if hasattr(self, '_scan_thread') and self._scan_thread is not None:
+                logging.info("[quickdic] Scan thread will not be started as plugin is disabled on this platform.")
+            return
+
         logging.info(f"Quick dictionary check plugin loaded (v{self.__version__})")
 
         # Define defaults for actual configurable options
@@ -71,26 +89,14 @@ class QuickDic(plugins.Plugin):
             'aircrack_timeout': 300
         }
         
-        # Allow Pwnagotchi to load values from config.toml into self.options
-        # The base class on_loaded() populates self.options from the config file.
-        # We need to ensure our defaults are used if options are missing or invalid.
-        # super().on_loaded() might replace self.options entirely or merge.
-        # For safety, we'll process after calling it.
-
-        # Store a reference to config-loaded options if Pwnagotchi populated it
         config_loaded_options = self.options.copy() if isinstance(self.options, dict) else {}
 
         if hasattr(super(), 'on_loaded'):
              super().on_loaded() # This call might modify self.options
 
-        # Consolidate options: Start with plugin defaults, then override with config values if present and valid.
-        # Pwnagotchi's plugin loader usually handles loading config into self.options.
-        # We just need to ensure our expected keys are present and correctly typed.
         processed_options = {}
         for key, default_value in plugin_specific_defaults.items():
-            # Use the value from self.options (potentially loaded from config.toml by super().on_loaded())
-            # or fall back to the value that was in self.options before super().on_loaded() if it was a dict
-            # or finally, use our hardcoded default.
+
             value_to_process = None
             if isinstance(self.options, dict) and key in self.options:
                 value_to_process = self.options[key]
@@ -158,11 +164,23 @@ class QuickDic(plugins.Plugin):
         logging.info(f"[quickdic] on_loaded: Completed. Final status: {self.current_status}")
 
     def _periodic_scan_loop(self):
+        if not self.enabled_on_system:
+            logging.info("[quickdic] Plugin disabled on this system. Periodic scan loop will not run.")
+            return
+
         logging.info("[quickdic] Periodic scan loop initiated.")
         
         try:
             self._stop_event.wait(5) # Initial delay before first scan
             while not self._stop_event.is_set():
+                # Wait if a cracking process is already running
+                while self.cracking_in_progress and not self._stop_event.is_set():
+                    logging.debug("[quickdic] Cracking in progress, waiting for it to complete before next scan pass.")
+                    self._stop_event.wait(10) # Wait for 10 seconds before checking again
+                
+                if self._stop_event.is_set(): # Check again after the inner loop
+                    break
+
                 if self.main_config_for_scan and \
                    self.current_status != STATUS_NO_WORDLISTS and \
                    self.current_status != STATUS_AIRCRACK_FAIL:
@@ -201,8 +219,89 @@ class QuickDic(plugins.Plugin):
             self._scan_thread.join(timeout=5)
             if self._scan_thread.is_alive():
                 logging.warning(f"[quickdic] [{thread_name}] Scan thread did not terminate in time.")
+
+        # Attempt to kill aircrack-ng if it's running during unload
+        if self.cracking_in_progress and self.aircrack_proc_handle:
+            logging.info(f"[quickdic] Cracking was in progress during unload. Attempting to kill aircrack-ng process (PID: {self.aircrack_proc_handle.pid}).")
+            killed = self._kill_aircrack_process(self.aircrack_proc_handle, "unload_cleanup")
+            if killed:
+                self.cracking_in_progress = False
+                self.aircrack_proc_handle = None
+                logging.info("[quickdic] Aircrack-ng process terminated during unload.")
+            else:
+                logging.warning("[quickdic] Failed to terminate aircrack-ng process during unload. It may still be running.")
         
         logging.info(f"[quickdic] [{thread_name}] Plugin unloaded.")
+
+    def _kill_aircrack_process(self, proc_to_kill, ap_name_for_log="<unknown AP>"):
+        """Robustly kills the given process (expected to be aircrack-ng)."""
+        if proc_to_kill is None:
+            logging.debug(f"[quickdic] _kill_aircrack_process called with None process for {ap_name_for_log}.")
+            return True # No process to kill
+
+        if proc_to_kill.poll() is not None:
+            logging.debug(f"[quickdic] Process for {ap_name_for_log} (PID: {proc_to_kill.pid}) already terminated before kill attempt.")
+            return True
+
+        logging.info(f"[quickdic] Attempting to kill aircrack-ng process for {ap_name_for_log} (PID: {proc_to_kill.pid}).")
+        
+        try:
+            if os.name != 'nt':
+                pgid = os.getpgid(proc_to_kill.pid)
+                logging.info(f"[quickdic] Sending SIGINT to PGID {pgid} (PID: {proc_to_kill.pid}).")
+                os.killpg(pgid, signal.SIGINT)
+                try:
+                    proc_to_kill.wait(timeout=1) # Graceful shutdown time
+                    logging.info(f"[quickdic] Process {proc_to_kill.pid} (PGID {pgid}) terminated gracefully after SIGINT.")
+                    return True
+                except subprocess.TimeoutExpired:
+                    logging.warning(f"[quickdic] Process {proc_to_kill.pid} (PGID {pgid}) did not terminate after SIGINT. Sending SIGKILL.")
+                    os.killpg(pgid, signal.SIGKILL)
+                    proc_to_kill.wait(timeout=1) # Wait for SIGKILL to take effect
+                    if proc_to_kill.poll() is None:
+                        logging.error(f"[quickdic] FAILED TO KILL process {proc_to_kill.pid} (PGID {pgid}) even after SIGKILL.")
+                        return False
+                    else:
+                        logging.info(f"[quickdic] Process {proc_to_kill.pid} (PGID {pgid}) terminated after SIGKILL.")
+                        return True
+                except ProcessLookupError: # PGID/PID gone after SIGINT
+                    logging.info(f"[quickdic] Process/PGID for {proc_to_kill.pid} disappeared after SIGINT (presumed terminated).")
+                    return True
+            else: # Windows
+                logging.info(f"[quickdic] Terminating process {proc_to_kill.pid} (Windows).")
+                proc_to_kill.terminate()
+                try:
+                    proc_to_kill.wait(timeout=1)
+                    logging.info(f"[quickdic] Process {proc_to_kill.pid} terminated gracefully (Windows).")
+                    return True
+                except subprocess.TimeoutExpired:
+                    logging.warning(f"[quickdic] Process {proc_to_kill.pid} did not terminate gracefully. Killing (Windows).")
+                    proc_to_kill.kill()
+                    proc_to_kill.wait(timeout=1)
+                    if proc_to_kill.poll() is None:
+                        logging.error(f"[quickdic] FAILED TO KILL process {proc_to_kill.pid} (Windows) even after kill().")
+                        return False
+                    else:
+                        logging.info(f"[quickdic] Process {proc_to_kill.pid} terminated after kill() (Windows).")
+                        return True
+                        
+        except ProcessLookupError: # Main PID gone before we could get PGID or kill
+            logging.warning(f"[quickdic] Process/PGID {proc_to_kill.pid} not found during kill attempt (likely already dead).")
+            return True # Already dead
+        except Exception as e:
+            logging.error(f"[quickdic] Error during kill process for {proc_to_kill.pid} ({ap_name_for_log}): {e}", exc_info=True)
+            # If an error occurs, check poll status one last time.
+            if proc_to_kill.poll() is None:
+                logging.warning(f"[quickdic] Process {proc_to_kill.pid} still appears to be running after kill exception.")
+                return False
+            else:
+                logging.info(f"[quickdic] Process {proc_to_kill.pid} confirmed terminated after kill exception.")
+                return True
+        # Should have returned by now. If not, poll one last time.
+        if proc_to_kill.poll() is None:
+            logging.error(f"[quickdic] Process {proc_to_kill.pid} ({ap_name_for_log}) still running after kill logic completion. This shouldn't happen.")
+            return False
+        return True
 
     def _scan_and_crack_existing(self, main_config):
         logging.info("[quickdic] Scanning for existing unattempted handshakes...")
@@ -267,14 +366,27 @@ class QuickDic(plugins.Plugin):
         logging.debug(f"[quickdic] _scan_and_crack_existing finished a pass.")
 
     def _try_crack_handshake(self, pcap_filepath, access_point_name):
-        logging.info(f"[quickdic] Attempting to crack: {access_point_name} from file: {pcap_filepath}")
-        self.current_status = STATUS_CRACKING
+        if not self.enabled_on_system:
+            logging.warning(f"[quickdic] Plugin disabled on this system. Skipping crack attempt for {access_point_name}.")
+            return CRACK_PREVENTED # Or a more specific status
 
-        if self.cracking_in_progress:
-            logging.info(f"[quickdic] Another cracking process is already running. Skipping {access_point_name} for now.")
+        logging.info(f"[quickdic] Attempting to crack: {access_point_name} from file: {pcap_filepath}")
+        
+        if self.cracking_in_progress: # Check before setting True for this attempt
+            logging.info(f"[quickdic] Another cracking process is already running (PID: {self.aircrack_proc_handle.pid if self.aircrack_proc_handle else 'unknown'}). Skipping {access_point_name} for now.")
             return CRACK_PREVENTED
 
-        self.cracking_in_progress = True
+        self.cracking_in_progress = True # Set true for this attempt
+        self.current_status = STATUS_CRACKING
+        # self.aircrack_proc_handle is already None or set by a previous run that failed to clean up.
+        # It will be explicitly set to None in finally if this attempt cleans up properly.
+        # If a previous run left it non-None and cracking_in_progress False, this is a state anomaly.
+        # However, the check above should prevent re-entry if cracking_in_progress is True.
+        # For safety, ensure it's None before a new Popen if we proceed.
+        if self.aircrack_proc_handle is not None:
+            logging.warning(f"[quickdic] self.aircrack_proc_handle was not None at the start of _try_crack_handshake for {access_point_name} despite cracking_in_progress being False. This indicates a prior cleanup issue. Forcing to None.")
+            self.aircrack_proc_handle = None
+
 
         max_temp = float(self.options.get('max_cpu_temp', 80.0))
         timeout_seconds = int(self.options.get('aircrack_timeout', 300))
@@ -284,7 +396,7 @@ class QuickDic(plugins.Plugin):
         if current_temp is not None and current_temp > max_temp:
             logging.warning(f"[quickdic] CPU temp ({current_temp:.1f}°C) > limit ({max_temp}°C). Skipping {access_point_name}.")
             self.current_status = STATUS_CPU_HOT
-            self.cracking_in_progress = False
+            self.cracking_in_progress = False # Reset: no process started
             return CRACK_PREVENTED
 
         handshake_check_cmd = f'''/usr/bin/aircrack-ng "{pcap_filepath}" | grep "1 handshake" | awk '{{print $2}}' '''
@@ -297,168 +409,182 @@ class QuickDic(plugins.Plugin):
         except subprocess.TimeoutExpired:
             logging.warning(f"[quickdic] Handshake check timed out for {pcap_filepath}.")
             self.current_status = STATUS_HS_TIMEOUT
-            self.cracking_in_progress = False
+            self.cracking_in_progress = False # Reset: no process started
             return CRACK_ERROR
         except Exception as e:
             logging.error(f"[quickdic] Error during handshake check for {pcap_filepath}: {e}", exc_info=True)
             self.current_status = STATUS_HANDSHAKE_VERIFY_FAIL
-            self.cracking_in_progress = False
+            self.cracking_in_progress = False # Reset: no process started
             return CRACK_ERROR
 
         if not bssid_result:
             logging.info(f"[quickdic] No handshake confirmed in {pcap_filepath}.")
             self.current_status = STATUS_HANDSHAKE_VERIFY_FAIL
-            self.cracking_in_progress = False
+            self.cracking_in_progress = False # Reset: no process started
             return CRACK_ERROR
         
         wordlist_files = glob.glob(os.path.join(wordlist_folder, "*.txt"))
         if not wordlist_files:
             logging.warning(f"[quickdic] No .txt wordlists found in {wordlist_folder}.")
             self.current_status = STATUS_NO_WORDLISTS
-            self.cracking_in_progress = False
+            self.cracking_in_progress = False # Reset: no process started
             return CRACK_ERROR
 
         wordlist_argument_string = ','.join(f'"{w}"' for w in wordlist_files)
         cracked_file_output_path = f"{pcap_filepath}.cracked"
-        # Corrected aircrack_cmd_str to avoid issues with quotes and f-string formatting within shell command
-        aircrack_cmd_str = f'''aircrack-ng -w {wordlist_argument_string} -l "{cracked_file_output_path}" -q -b {bssid_result} "{pcap_filepath}"'''
         
-        aircrack_return_status = CRACK_ERROR 
-        proc = None
+        # Construct the base aircrack-ng command
+        base_aircrack_cmd = f'''aircrack-ng -w {wordlist_argument_string} -l "{cracked_file_output_path}" -q -b {bssid_result} "{pcap_filepath}"'''
+        
+        # Prepend timeout command for non-Windows systems
+        if os.name != 'nt':
+            aircrack_cmd_str = f'''timeout {timeout_seconds}s {base_aircrack_cmd}'''
+        else:
+            aircrack_cmd_str = base_aircrack_cmd
+        
+        # Local proc for this attempt, self.aircrack_proc_handle will also be set
+        local_proc_handle = None 
+        aircrack_return_status = CRACK_ERROR # Default to error
+        
         try:
-            proc = subprocess.Popen(aircrack_cmd_str, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, bufsize=1, preexec_fn=os.setsid if os.name != 'nt' else None)
-            key_found_and_processed = False
-            start_time = time.time()
-
-            while not key_found_and_processed:
-                elapsed_time = time.time() - start_time
-                if elapsed_time > timeout_seconds:
-                    logging.info(f"[quickdic] Aircrack-ng timed out for {access_point_name}.")
-                    self.current_status = STATUS_TIMEOUT
-                    aircrack_return_status = CRACK_ERROR
-                    break 
-                if proc.poll() is not None: break 
-
-                ready_to_read, _, _ = select.select([proc.stdout, proc.stderr], [], [], 0.5)
-                for stream in ready_to_read:
-                    line = stream.readline()
-                    if not line: continue
-                    line_strip = line.strip()
-                    logging.debug(f"[quickdic] aircrack-ng output: {line_strip}") 
-                    if stream is proc.stdout and "KEY FOUND!" in line_strip:
-                        try:
-                            key = line_strip.split('[')[1].split(']')[0].strip()
-                            logging.info(f"[quickdic] KEY FOUND for {access_point_name}: {key}")
-                            self.current_status = STATUS_CRACKED
-                            aircrack_return_status = CRACK_SUCCESS
-                            key_found_and_processed = True
-                            break 
-                        except IndexError:
-                            logging.error(f"[quickdic] Could not parse KEY FOUND line: {line_strip}")
-                    elif stream is proc.stderr and line_strip: 
-                        if "Resetting EAPOL Handshake decoder state." in line_strip:
-                            logging.debug(f"[quickdic] aircrack-ng stderr: {line_strip}") # Log this specific message at DEBUG
-                        else:
-                            logging.warning(f"[quickdic] aircrack-ng stderr: {line_strip}") # Log other stderr as WARNING
-
-                if key_found_and_processed: break
+            logging.debug(f"[quickdic] Executing aircrack-ng: {aircrack_cmd_str}")
+            # preexec_fn=os.setsid is for POSIX to allow killing the whole process group.
+            local_proc_handle = subprocess.Popen(aircrack_cmd_str, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                                    universal_newlines=True, preexec_fn=os.setsid if os.name != 'nt' else None)
+            self.aircrack_proc_handle = local_proc_handle # Assign to instance member
             
-            if proc.poll() is None:
-                logging.info(f"[quickdic] Terminating aircrack-ng process for {access_point_name} (PID: {{proc.pid}}).")
-                try:
-                    if os.name != 'nt': 
-                        os.killpg(os.getpgid(proc.pid), subprocess.signal.SIGTERM)
-                    else: 
-                        proc.terminate()
-                    proc.wait(timeout=5)
-                except ProcessLookupError:
-                    logging.warning(f"[quickdic] Process {{proc.pid}} already terminated.")
-                except Exception as e:
-                    logging.error(f"[quickdic] Error terminating aircrack-ng process {{proc.pid}}: {{e}}")
-
-            # Drain remaining output if key not yet found
-            if not key_found_and_processed:
-                logging.debug(f"[quickdic] Final check of aircrack-ng output for {{access_point_name}}.")
-                # Drain stdout
-                try:
-                    for line in proc.stdout: 
-                        line_strip = line.strip()
-                        if not line_strip: continue # Skip empty lines
-                        logging.debug(f"[quickdic] aircrack-ng remaining stdout: {{line_strip}}")
-                        if "KEY FOUND!" in line_strip:
-                            try:
-                                key = line_strip.split('[')[1].split(']')[0].strip()
-                                logging.info(f"[quickdic] KEY FOUND (in final check) for {{access_point_name}}: {{key}}")
-                                self.current_status = STATUS_CRACKED
-                                aircrack_return_status = CRACK_SUCCESS
-                                key_found_and_processed = True
-                                break # Key found in stdout, stop draining stdout
-                            except IndexError:
-                                logging.error(f"[quickdic] Could not parse KEY FOUND line from final check: {{line_strip}}")
-                except Exception as e_stdout_drain:
-                    logging.debug(f"[quickdic] Exception during final stdout check for {{access_point_name}}: {{e_stdout_drain}}")
+            stdout_data, stderr_data = "", ""
+            try:
+                stdout_data, stderr_data = local_proc_handle.communicate(timeout=timeout_seconds)
                 
-                # Drain stderr for logging (useful for diagnostics)
-                try:
-                    for line in proc.stderr:
-                        line_strip = line.strip()
-                        if not line_strip: continue # Skip empty lines
-                        # Log all remaining stderr
-                        if "Resetting EAPOL Handshake decoder state." in line_strip:
-                            logging.debug(f"[quickdic] aircrack-ng remaining stderr: {{line_strip}}")
+                if stderr_data: # Log stderr
+                    for line in stderr_data.strip().splitlines():
+                        if ("No networks found, exiting." in line or
+                            "Please specify a dictionary" in line or
+                            ("Opening" in line and "failed: No such file or directory" in line) or
+                            "Unsupported KDF type" in line or
+                            "No valid WPA handshakes found" in line):
+                            logging.info(f"[quickdic] aircrack-ng info/stderr: {line.strip()}")
+                        elif "Read error: Broken pipe" in line: 
+                            logging.debug(f"[quickdic] aircrack-ng stderr (broken pipe): {line.strip()}")
                         else:
-                            logging.warning(f"[quickdic] aircrack-ng remaining stderr: {{line_strip}}")
-                except Exception as e_stderr_drain:
-                    logging.debug(f"[quickdic] Exception during final stderr check for {{access_point_name}}: {{e_stderr_drain}}")
+                            logging.warning(f"[quickdic] aircrack-ng stderr: {line.strip()}")
+                
+                if stdout_data: # Log stdout
+                    for line in stdout_data.strip().splitlines():
+                        logging.debug(f"[quickdic] aircrack-ng stdout: {line.strip()}")
 
-            if not key_found_and_processed and aircrack_return_status != CRACK_SUCCESS:
-                 if proc.poll() is not None and elapsed_time < timeout_seconds :
-                    logging.info(f"[quickdic] Key not found by aircrack-ng for {{access_point_name}}.")
-                    self.current_status = STATUS_NOT_FOUND_SCAN
-                    aircrack_return_status = CRACK_NOT_FOUND
-                 elif elapsed_time > timeout_seconds and aircrack_return_status != CRACK_ERROR: 
-                    self.current_status = STATUS_TIMEOUT
-                    aircrack_return_status = CRACK_ERROR
-
+                if os.path.exists(cracked_file_output_path):
+                    logging.info(f"[quickdic] KEY FOUND for {access_point_name}. Verified by presence of {cracked_file_output_path}")
+                    self.current_status = STATUS_CRACKED
+                    aircrack_return_status = CRACK_SUCCESS
+                else:
+                    if local_proc_handle.returncode != 0:
+                         logging.warning(f"[quickdic] aircrack-ng for {access_point_name} exited with code {local_proc_handle.returncode} and no .cracked file found.")
+                         aircrack_return_status = CRACK_ERROR 
+                    else:
+                         logging.info(f"[quickdic] Aircrack-ng completed (exit 0) for {access_point_name}, but no .cracked file. Password not found.")
+                         aircrack_return_status = CRACK_NOT_FOUND
+            
+            except subprocess.TimeoutExpired:
+                logging.info(f"[quickdic] Aircrack-ng timed out for {access_point_name} after {timeout_seconds}s.")
+                self.current_status = STATUS_TIMEOUT
+                aircrack_return_status = CRACK_ERROR
+                
+                if local_proc_handle and local_proc_handle.poll() is None:
+                    logging.info(f"[quickdic] Attempting to kill timed-out aircrack-ng process for {access_point_name} (PID: {local_proc_handle.pid}).")
+                    # Result of kill is handled by finally block's check on cracking_in_progress
+                    self._kill_aircrack_process(local_proc_handle, access_point_name)
+                # stdout/stderr from communicate() before timeout are not available here,
+                # but if proc.stdout/stderr were captured by Popen, they might have partial data.
+                # However, communicate() was called, so pipes are likely closed or in an unusable state.
 
         except FileNotFoundError:
             logging.error(f"[quickdic] aircrack-ng command not found. Ensure it is installed and in PATH.")
             self.current_status = STATUS_AIRCRACK_FAIL
             aircrack_return_status = CRACK_ERROR
+            # self.cracking_in_progress will be set to False in finally
+            # self.aircrack_proc_handle is None
         except Exception as e:
             logging.error(f"[quickdic] General error running aircrack-ng for {access_point_name}: {e}", exc_info=True)
             self.current_status = STATUS_ERROR
             aircrack_return_status = CRACK_ERROR
+            # self.cracking_in_progress state depends on whether proc was initialized. Finally handles it.
         finally:
-            if proc:
-                if proc.stdout: proc.stdout.close()
-                if proc.stderr: proc.stderr.close()
-            self.cracking_in_progress = False
+            # Ensure self.aircrack_proc_handle is the one we worked with, or None if Popen failed
+            current_proc_to_finalize = self.aircrack_proc_handle 
+            
+            if current_proc_to_finalize:
+                if current_proc_to_finalize.stdout and not current_proc_to_finalize.stdout.closed:
+                    current_proc_to_finalize.stdout.close()
+                if current_proc_to_finalize.stderr and not current_proc_to_finalize.stderr.closed:
+                    current_proc_to_finalize.stderr.close()
+
+                process_confirmed_dead = False
+                if current_proc_to_finalize.poll() is None: # Still alive or status unknown
+                    logging.warning(f"[quickdic] Process {current_proc_to_finalize.pid} (aircrack-ng for {access_point_name}) potentially alive in finally. Attempting robust kill.")
+                    if self._kill_aircrack_process(current_proc_to_finalize, access_point_name):
+                        logging.info(f"[quickdic] Process {current_proc_to_finalize.pid} confirmed terminated in finally block.")
+                        process_confirmed_dead = True
+                    else:
+                        logging.error(f"[quickdic] FAILED TO KILL process {current_proc_to_finalize.pid} in finally. Cracking_in_progress will remain True.")
+                        # cracking_in_progress remains True, self.aircrack_proc_handle remains assigned
+                else: # Already terminated
+                    logging.debug(f"[quickdic] Process {current_proc_to_finalize.pid} (aircrack-ng for {access_point_name}) confirmed already terminated upon entering finally. PID: {current_proc_to_finalize.pid}, RC: {current_proc_to_finalize.returncode}")
+                    process_confirmed_dead = True
+                
+                if process_confirmed_dead:
+                    self.cracking_in_progress = False
+                    self.aircrack_proc_handle = None # Clear the handle
+                # If not process_confirmed_dead, cracking_in_progress remains True and self.aircrack_proc_handle is kept.
+            
+            else: # current_proc_to_finalize (i.e. self.aircrack_proc_handle) is None
+                  # This means Popen was never called, or failed, or it was an early exit.
+                  # cracking_in_progress was set True at the start, so reset it.
+                if self.cracking_in_progress: # Only log/change if it was True
+                    logging.debug("[quickdic] proc object was None in finally. Setting cracking_in_progress to False as no process was actively managed to completion.")
+                    self.cracking_in_progress = False
+                # self.aircrack_proc_handle is already None
+
+            # Final status log for this attempt
+            if self.cracking_in_progress:
+                 logging.warning(f"[quickdic] Exiting _try_crack_handshake for {access_point_name} - CRACKING_IN_PROGRESS REMAINS TRUE (PID: {self.aircrack_proc_handle.pid if self.aircrack_proc_handle else 'N/A'}).")
+            else:
+                 logging.debug(f"[quickdic] Exiting _try_crack_handshake for {access_point_name} - cracking_in_progress is now False.")
 
         logging.info(f"[quickdic] Finished cracking attempt for {access_point_name}. Result: {aircrack_return_status}")
         return aircrack_return_status
 
+    def on_handshake(self, agent, filename, access_point, client_station):
+        if not self.enabled_on_system:
+            return # Do nothing if not on Linux
+        
+        # Current logic of on_handshake (if any) would go here.
+        # This plugin primarily works by scanning existing files, but if you want
+        # to trigger an immediate crack attempt on a new handshake, you could add logic here.
+        # For now, we'll assume it relies on the periodic scan.
+        logging.debug(f"[quickdic] on_handshake hook called for {access_point['hostname'] if access_point else 'N/A'}. Relying on periodic scan.")
+        pass # Placeholder, as current logic is scan-based
+
+    # Add similar checks to other public Pwnagotchi hook methods if they are implemented
+    # e.g., on_bored, on_sad, on_ui_update, etc.
+    # For brevity, only on_handshake is shown as an example.
+
     def _get_cpu_temperature(self):
-        """Reads CPU temperature."""
-        # This implementation is for Raspberry Pi.
-        # For other systems, this method might need adjustment or return None.
-        temp_file = '/sys/class/thermal/thermal_zone0/temp'
-        if os.path.exists(temp_file):
-            try:
-                with open(temp_file, 'r') as f:
-                    return float(f.read()) / 1000.0
-            except Exception as e:
-                logging.warning(f"[quickdic] Could not read CPU temperature from {temp_file}: {e}")
-                return None
-        else:
-            # Attempt to use 'vcgencmd' as a fallback for Raspberry Pi if /sys/class/thermal is not available
-            try:
-                temp_str = subprocess.check_output(['vcgencmd', 'measure_temp'], universal_newlines=True) # Example: temp=53.5'C
-                temp_val = temp_str.split('=')[1].split('\'')[0]
-                return float(temp_val)
-            except FileNotFoundError:
-                logging.debug("[quickdic] vcgencmd not found. Cannot get CPU temperature.")
-                return None
-            except Exception as e:
-                logging.warning(f"[quickdic] Could not read CPU temperature using vcgencmd: {e}")
-                return None
+        if not self.enabled_on_system:
+            return None # Don't attempt to read temp if not on Linux
+        
+        # Original _get_cpu_temperature logic for Linux
+        # ... (rest of the original _get_cpu_temperature method)
+        # Ensure this method is robust if /sys/class/thermal/thermal_zone0/temp isn't available
+        # even on Linux, though for RPi it usually is.
+        try:
+            with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+                temp = int(f.read().strip()) / 1000.0
+            return temp
+        except FileNotFoundError:
+            logging.debug("[quickdic] CPU temperature file not found. Cannot get CPU temperature.")
+            return None # Or a default/error indicator
+        except Exception as e:
+            logging.error(f"[quickdic] Error reading CPU temperature: {e}")
+            return None

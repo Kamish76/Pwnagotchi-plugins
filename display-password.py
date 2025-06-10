@@ -78,7 +78,10 @@ class DisplayPassword(plugins.Plugin):
 
         if not self.config:
             logging.warning("DisplayPassword: Config not available yet.")
-            # Do not update UI to prevent "Cfg err" from flashing if config is just loading
+            # If config is persistently missing, update UI to reflect this state.
+            if self.last_displayed_password_info_str != 'Waiting for cfg...':
+                ui.set('display-password', 'Waiting for cfg...')
+                self.last_displayed_password_info_str = 'Waiting for cfg...'
             return
 
         handshakes_dir = self.config.get('bettercap', {}).get('handshakes')
@@ -151,13 +154,19 @@ class DisplayPassword(plugins.Plugin):
                                 password = parts[3]
                             elif len(parts) == 1 and parts[0]: # Single field, assume it's a password
                                 password = parts[0]
-                                # Try to use filename (sans ext) as SSID, if not BSSID-like
-                                fn_name_part, _ = os.path.splitext(filename)
-                                if not (len(fn_name_part) == 17 and fn_name_part.count(':') == 5):
-                                    ssid = fn_name_part
-                                    logging.info(f"DisplayPassword: Used filename '{ssid}' as SSID for password-only line in {filename}")
-                                else: # Filename looks like a BSSID, don't use as SSID here. Password only.
-                                    logging.info(f"DisplayPassword: Password-only line in {filename}, filename is BSSID-like, SSID unknown.")
+                                # Try to use filename (sans ext) as SSID
+                                fn_name_part_no_ext, _ = os.path.splitext(filename)
+                                
+                                if '_' in fn_name_part_no_ext:
+                                    # Delimit by '_' for SSID as requested
+                                    ssid = fn_name_part_no_ext.split('_')[0]
+                                    #logging.info(f"DisplayPassword: Used filename part '{ssid}' (before '_') as SSID for password-only line in {filename}")
+                                elif not (len(fn_name_part_no_ext) == 17 and fn_name_part_no_ext.count(':') == 5):
+                                    # No underscore, use full name if not BSSID-like
+                                    ssid = fn_name_part_no_ext
+                                    #logging.info(f"DisplayPassword: Used filename '{ssid}' as SSID for password-only line in {filename}")
+                                #else: # Filename looks like a BSSID (and no underscore), don't use as SSID here. Password only.
+                                    #logging.info(f"DisplayPassword: Password-only line in {filename}, filename is BSSID-like, SSID unknown.")
                             else:
                                 logging.warning(f"DisplayPassword: Malformed/unhandled line in {filename}: {last_line_content}")
                         

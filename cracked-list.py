@@ -167,6 +167,7 @@ class CrackedList(plugins.Plugin):
 
                 for file_path in cracked_files:
                     logging.debug(f"[CrackedList] Processing file: {file_path}")
+                    filename = os.path.basename(file_path)
                     try:
                         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                             for line_number, line in enumerate(f, 1):
@@ -175,63 +176,82 @@ class CrackedList(plugins.Plugin):
                                     continue
                                 
                                 parts = line.split(':')
-                                # We expect at least 3 parts: BSSID, Password, SSID in some order
-                                # Or BSSID, some_other_field, SSID, Password
                                 bssid, ssid, password_val = None, None, None
 
-                                if len(parts) >= 3:
-                                    # Assuming format like BSSID:Password:SSID (quickdic specific)
-                                    if len(parts) == 3:
-                                        # Check if parts[0] looks like a BSSID (e.g., AA:BB:CC:DD:EE:FF)
-                                        if len(parts[0]) == 17 and parts[0].count(':') == 5:
-                                            bssid = parts[0]
-                                            password_val = parts[1]
-                                            ssid = parts[2]
-                                        # Or ESSID:Password:BSSID
-                                        elif len(parts[2]) == 17 and parts[2].count(':') == 5:
-                                            ssid = parts[0]
-                                            password_val = parts[1]
-                                            bssid = parts[2]
-                                        else: # Fallback: try to infer from filename if possible, or skip
-                                            logging.warning(f"[CrackedList] Line format in {file_path} (line {line_number}) not recognized as BSSID:Pass:SSID or SSID:Pass:BSSID: {line}")
-                                            continue
-                                    # Assuming format like BSSID:HEXKEY:SSID:Password (similar to wpa-sec)
-                                    elif len(parts) >= 4:
+                                if filename == 'wpa-sec.cracked.potfile':
+                                    if len(parts) >= 4: # BSSID:HEXKEY:SSID:Password
                                         bssid = parts[0]
                                         ssid = parts[2]
                                         password_val = parts[3]
                                     else:
-                                        logging.warning(f"[CrackedList] Skipping line in {file_path} (line {line_number}) due to insufficient parts: {line}")
+                                        logging.warning(f"[CrackedList] Malformed line in {filename} (line {line_number}): {line}")
                                         continue
-
-                                    if bssid and ssid and password_val:
-                                        # Basic validation for BSSID format
-                                        if not (len(bssid) == 17 and bssid.count(':') == 5):
-                                            logging.warning(f"[CrackedList] Invalid BSSID format '{bssid}' in {file_path} (line {line_number}): {line}")
-                                            continue
-                                        entry_tuple = (bssid.upper(), ssid, password_val)
-                                        if entry_tuple not in unique_entries:
-                                            unique_entries.add(entry_tuple)
-                                            logging.debug(f"[CrackedList] Added entry: {entry_tuple}")
+                                else: # Other *.cracked files
+                                    if len(parts) == 3:
+                                        if len(parts[0]) == 17 and parts[0].count(':') == 5: # BSSID:Password:SSID
+                                            bssid, password_val, ssid = parts[0], parts[1], parts[2]
+                                        elif len(parts[2]) == 17 and parts[2].count(':') == 5: # SSID:Password:BSSID
+                                            ssid, password_val, bssid = parts[0], parts[1], parts[2]
                                         else:
-                                            logging.debug(f"[CrackedList] Duplicate entry skipped: {entry_tuple}")
+                                            logging.warning(f"[CrackedList] Unrecognized 3-part format in {filename} (line {line_number}): {line}")
+                                            continue
+                                    elif len(parts) >= 4: # BSSID:ANY_FIELD:SSID:Password (common fallback)
+                                        bssid = parts[0]
+                                        ssid = parts[2]
+                                        password_val = parts[3]
+                                    elif len(parts) == 1 and parts[0]: # Single field, assume it's a password
+                                        password_val = parts[0]
+                                        # Try to use filename (sans ext) as SSID, if not BSSID-like
+                                        fn_name_part, _ = os.path.splitext(filename)
+                                        if not (len(fn_name_part) == 17 and fn_name_part.count(':') == 5):
+                                            ssid = fn_name_part
+                                            logging.info(f"[CrackedList] Used filename '{ssid}' as SSID for password-only line in {filename} (line {line_number})")
+                                        else: # Filename looks like a BSSID, don't use as SSID here. Password only.
+                                            logging.info(f"[CrackedList] Password-only line in {filename} (line {line_number}), filename is BSSID-like, SSID unknown.")
+                                            # We need an SSID or BSSID for the table, so this might not be ideal unless we default one.
+                                            # For now, if only password, we might skip or assign a placeholder.
+                                            # Let's require at least an SSID or BSSID for the table.
+                                            if not ssid and not bssid: # If we couldn't infer SSID and no BSSID
+                                                logging.warning(f"[CrackedList] Password-only line in {filename} (line {line_number}) without inferable SSID/BSSID. Skipping: {line}")
+                                                continue
                                     else:
-                                        logging.warning(f"[CrackedList] Could not parse BSSID, SSID, or Password from line in {file_path} (line {line_number}): {line}")
+                                        logging.warning(f"[CrackedList] Malformed/unhandled line in {filename} (line {line_number}): {line}")
+                                        continue
+                                
+                                if password_val and (ssid or bssid): # Ensure we have a password and at least one identifier
+                                    # Basic validation for BSSID format if present
+                                    if bssid and not (len(bssid) == 17 and bssid.count(':') == 5):
+                                        logging.warning(f"[CrackedList] Invalid BSSID format '{bssid}' in {filename} (line {line_number}): {line}. Attempting to use as SSID if SSID is missing.")
+                                        if not ssid: # If original SSID was none, and BSSID is malformed, maybe it was meant to be an SSID
+                                            ssid = bssid # Try using the malformed bssid as an ssid
+                                        bssid = "N/A" # Mark BSSID as N/A
+                                    
+                                    # Ensure SSID and BSSID are strings, default to "N/A" if None
+                                    current_ssid = ssid if ssid else "N/A"
+                                    current_bssid = bssid.upper() if bssid else "N/A"
 
+                                    entry_tuple = (current_bssid, current_ssid, password_val)
+                                    if entry_tuple not in unique_entries:
+                                        unique_entries.add(entry_tuple)
+                                        logging.debug(f"[CrackedList] Added entry: {entry_tuple}")
+                                    else:
+                                        logging.debug(f"[CrackedList] Duplicate entry skipped: {entry_tuple}")
                                 else:
-                                    logging.warning(f"[CrackedList] Skipping malformed line in {file_path} (line {line_number}): {line}")
+                                    logging.warning(f"[CrackedList] Could not parse essential data (Password and SSID/BSSID) from line in {filename} (line {line_number}): {line}")
+                                    
                     except Exception as e:
                         logging.error(f"[CrackedList] Error reading file {file_path}: {e}")
                         logging.debug(e, exc_info=True)
 
                 # Sort unique entries by SSID (the second element in the tuple), case-insensitive
-                sorted_entries = sorted(list(unique_entries), key=lambda x: x[1].lower())
+                # then by BSSID (the first element)
+                sorted_entries = sorted(list(unique_entries), key=lambda x: (x[1].lower(), x[0].lower()))
 
-                for bssid, ssid, password_val in sorted_entries:
+                for bssid_val, ssid_val, pass_val in sorted_entries: # Renamed to avoid conflict
                     passwords_data.append({
-                        "ssid": ssid,
-                        "bssid": bssid,
-                        "password": password_val
+                        "ssid": ssid_val,
+                        "bssid": bssid_val,
+                        "password": pass_val
                     })
                 
                 logging.info(f"[CrackedList] Rendering template with {len(passwords_data)} passwords.")
